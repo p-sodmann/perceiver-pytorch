@@ -6,6 +6,7 @@ from torch import nn, einsum
 import torch.nn.functional as F
 
 from einops import rearrange, repeat
+import random
 
 # helpers
 
@@ -218,9 +219,16 @@ class Perceiver(nn.Module):
         assert len(axis) == self.input_axis, 'input data must have the right number of axis'
 
         if self.fourier_encode_data:
-            # calculate fourier encoded positions in the range of [-1, 1], for all axis
-
-            axis_pos = list(map(lambda size: torch.linspace(-1., 1., steps = size, device = device), axis))
+            # instead of squeezing all positions between -1 and +1, we want to train on relative positions
+            # to achieve this, we try a random offset for the position
+            fourier_resolution = 64
+            if self.training:
+                start_pos = random.randint(0, 1024)
+            else:
+                start_pos = 0
+            
+            # we changed this to a fixed step distance, and added a random offset. 
+            axis_pos = list(map(lambda size: torch.arange(start_pos, size+start_pos, device = device)/fourier_resolution, axis))
             pos = torch.stack(torch.meshgrid(*axis_pos), dim = -1)
             enc_pos = fourier_encode(pos, self.max_freq, self.num_freq_bands, base = self.freq_base)
             enc_pos = rearrange(enc_pos, '... n d -> ... (n d)')
@@ -244,5 +252,4 @@ class Perceiver(nn.Module):
                 x = self_attn(x) + x
                 x = self_ff(x) + x
 
-        x = x.mean(dim = -2)
-        return self.to_logits(x)
+        return self.to_logits(x.mean(dim = -2)), self.to_logits(x)
