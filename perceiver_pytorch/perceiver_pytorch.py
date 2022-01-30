@@ -222,11 +222,8 @@ class Perceiver(nn.Module):
             # instead of squeezing all positions between -1 and +1, we want to train on relative positions
             # to achieve this, we try a random offset for the position
             fourier_resolution = 64
-            if self.training:
-                start_pos = random.randint(0, 1024)
-            else:
-                start_pos = 0
-            
+            start_pos = random.randint(0, 1024) if self.training else 0
+
             # we changed this to a fixed step distance, and added a random offset. 
             axis_pos = list(map(lambda size: torch.arange(start_pos, size+start_pos, device = device)/fourier_resolution, axis))
             pos = torch.stack(torch.meshgrid(*axis_pos), dim = -1)
@@ -252,4 +249,7 @@ class Perceiver(nn.Module):
                 x = self_attn(x) + x
                 x = self_ff(x) + x
 
-        return self.to_logits(x.mean(dim = -2)), self.to_logits(x)
+        l = self.to_logits(x)
+        max_val, indices = l.max(dim = -2)
+        
+        return (max_val + l.mean())/2, l 
