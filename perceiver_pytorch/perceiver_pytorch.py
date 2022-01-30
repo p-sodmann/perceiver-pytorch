@@ -7,6 +7,7 @@ import torch.nn.functional as F
 
 from einops import rearrange, repeat
 import random
+from einops.layers.torch import Reduce
 
 # helpers
 
@@ -17,27 +18,28 @@ def default(val, d):
     return val if exists(val) else d
 
 def cache_fn(f):
-    cache = None
+    cache = dict()
     @wraps(f)
-    def cached_fn(*args, _cache = True, **kwargs):
+    def cached_fn(*args, _cache = True, key = None, **kwargs):
         if not _cache:
             return f(*args, **kwargs)
         nonlocal cache
-        if cache is not None:
-            return cache
-        cache = f(*args, **kwargs)
-        return cache
+        if key in cache:
+            return cache[key]
+        result = f(*args, **kwargs)
+        cache[key] = result
+        return result
     return cached_fn
 
-def fourier_encode(x, max_freq, num_bands = 4, base = 2):
+def fourier_encode(x, max_freq, num_bands = 4):
     x = x.unsqueeze(-1)
     device, dtype, orig_x = x.device, x.dtype, x
 
-    scales = torch.logspace(0., log(max_freq / 2) / log(base), num_bands, base = base, device = device, dtype = dtype)
+    scales = torch.linspace(1., max_freq / 2, num_bands, device = device, dtype = dtype)
     scales = scales[(*((None,) * (len(x.shape) - 1)), Ellipsis)]
 
     x = x * scales * pi
-    x = torch.cat([x.sin(), x.cos()], dim=-1)
+    x = torch.cat([x.sin(), x.cos()], dim = -1)
     x = torch.cat((x, orig_x), dim = -1)
     return x
 
@@ -71,8 +73,8 @@ class FeedForward(nn.Module):
         self.net = nn.Sequential(
             nn.Linear(dim, dim * mult * 2),
             GEGLU(),
-            nn.Dropout(dropout),
-            nn.Linear(dim * mult, dim)
+            nn.Linear(dim * mult, dim),
+            nn.Dropout(dropout)
         )
 
     def forward(self, x):
@@ -90,10 +92,8 @@ class Attention(nn.Module):
         self.to_q = nn.Linear(query_dim, inner_dim, bias = False)
         self.to_kv = nn.Linear(context_dim, inner_dim * 2, bias = False)
 
-        self.to_out = nn.Sequential(
-            nn.Linear(inner_dim, query_dim),
-            nn.Dropout(dropout)
-        )
+        self.dropout = nn.Dropout(dropout)
+        self.to_out = nn.Linear(inner_dim, query_dim)
 
     def forward(self, x, context = None, mask = None):
         h = self.heads
@@ -114,6 +114,7 @@ class Attention(nn.Module):
 
         # attention, what we cannot get enough of
         attn = sim.softmax(dim = -1)
+        attn = self.dropout(attn)
 
         out = einsum('b i j, b j d -> b i d', attn, v)
         out = rearrange(out, '(b h) n d -> b n (h d)', h = h)
@@ -128,7 +129,6 @@ class Perceiver(nn.Module):
         num_freq_bands,
         depth,
         max_freq,
-        freq_base = 2,
         input_channels = 3,
         input_axis = 2,
         num_latents = 512,
@@ -142,7 +142,8 @@ class Perceiver(nn.Module):
         ff_dropout = 0.,
         weight_tie_layers = False,
         fourier_encode_data = True,
-        self_per_cross_attn = 1
+        self_per_cross_attn = 1,
+        final_classifier_head = True
     ):
         """The shape of the final attention mechanism will be:
         depth * (cross attention -> self_per_cross_attn * self attention)
@@ -170,12 +171,12 @@ class Perceiver(nn.Module):
               the input_axis given. defaults to True, but can be turned off
               if you are fourier encoding the data yourself.
           self_per_cross_attn: Number of self attention blocks per cross attn.
+          final_classifier_head: mean pool and project embeddings to number of classes (num_classes) at the end
         """
         super().__init__()
         self.input_axis = input_axis
         self.max_freq = max_freq
         self.num_freq_bands = num_freq_bands
-        self.freq_base = freq_base
 
         self.fourier_encode_data = fourier_encode_data
         fourier_channels = (input_axis * ((num_freq_bands * 2) + 1)) if fourier_encode_data else 0
@@ -197,10 +198,10 @@ class Perceiver(nn.Module):
 
             self_attns = nn.ModuleList([])
 
-            for _ in range(self_per_cross_attn):
+            for block_ind in range(self_per_cross_attn):
                 self_attns.append(nn.ModuleList([
-                    get_latent_attn(**cache_args),
-                    get_latent_ff(**cache_args)
+                    get_latent_attn(**cache_args, key = block_ind),
+                    get_latent_ff(**cache_args, key = block_ind)
                 ]))
 
             self.layers.append(nn.ModuleList([
@@ -214,23 +215,24 @@ class Perceiver(nn.Module):
             nn.Linear(latent_dim, num_classes)
         )
 
-    def forward(self, data, mask = None):
-        b, *axis, _, device = *data.shape, data.device
+    def forward(
+        self,
+        data,
+        mask = None,
+        return_embeddings = False
+    ):
+        b, *axis, _, device, dtype = *data.shape, data.device, data.dtype
         assert len(axis) == self.input_axis, 'input data must have the right number of axis'
 
         if self.fourier_encode_data:
             # instead of squeezing all positions between -1 and +1, we want to train on relative positions
             # to achieve this, we try a random offset for the position
             fourier_resolution = 64
-            if self.training:
-                start_pos = random.randint(0, 1024)
-            else:
-                start_pos = 0
-            
-            # we changed this to a fixed step distance, and added a random offset. 
-            axis_pos = list(map(lambda size: torch.arange(start_pos, size+start_pos, device = device)/fourier_resolution, axis))
-            pos = torch.stack(torch.meshgrid(*axis_pos), dim = -1)
-            enc_pos = fourier_encode(pos, self.max_freq, self.num_freq_bands, base = self.freq_base)
+            start_pos = random.randint(0, 1024) if self.training else 0
+
+            axis_pos = list(map(lambda size: torch.linspace(-1., 1., steps=size, device=device, dtype=dtype), axis))
+            pos = torch.stack(torch.meshgrid(*axis_pos, indexing = 'ij'), dim = -1)
+            enc_pos = fourier_encode(pos, self.max_freq, self.num_freq_bands)
             enc_pos = rearrange(enc_pos, '... n d -> ... (n d)')
             enc_pos = repeat(enc_pos, '... -> b ...', b = b)
 
@@ -252,4 +254,11 @@ class Perceiver(nn.Module):
                 x = self_attn(x) + x
                 x = self_ff(x) + x
 
-        return self.to_logits(x.mean(dim = -2)), self.to_logits(x)
+        # allow for fetching embeddings
+
+        if return_embeddings:
+            return x
+
+        # to logits
+
+        return self.to_logits(x)
